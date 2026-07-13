@@ -47,6 +47,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { BaseCyclePhase, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { chat as gatewayChat, getChatModel, probeChatModel } from '../ai/gateway.ts';
 import { normalizeModelId } from '../model-id.ts';
+import { resolveAlias } from '../model-config.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { GBrainError } from '../types.ts';
@@ -392,9 +393,18 @@ class ProposeTakesPhase extends BaseCyclePhase {
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
     const deadlineMs = opts.deadlineMs ?? ProposeTakesPhase.PHASE_DEADLINE_MS;
     const phaseStartMs = Date.now();
+    // Resolve the extractor model ONCE: explicit override > the per-phase
+    // config key > the reasoning-tier config > the gateway's configured chat
+    // model. One resolved provider-prefixed string drives the chat call, the
+    // budget estimate, and the stored model_id — so telemetry can never
+    // record a model that didn't run. Brains with no phase/tier config keep
+    // the gateway chat model, exactly like before this change.
+    const phaseModelCfg = (await engine.getConfig('models.propose_takes'))?.trim()
+      || (await engine.getConfig('models.tier.reasoning'))?.trim();
+    const extractorModelId = opts.model
+      ?? (phaseModelCfg ? await resolveAlias(engine, phaseModelCfg) : getChatModel());
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
-    const modelId = opts.model ?? getChatModel();
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /
@@ -403,13 +413,13 @@ class ProposeTakesPhase extends BaseCyclePhase {
     // extractor bypasses the gateway, so it is never gated. (Takeover of
     // PR #1979's intent by @shawnduggan.)
     if (!opts.extractor) {
-      const probe = probeChatModel(normalizeModelId(modelId));
+      const probe = probeChatModel(normalizeModelId(extractorModelId));
       if (!probe.ok) {
         return {
           summary: `propose_takes skipped: ${probe.detail}`,
           details: {
             reason: 'no_provider',
-            model: modelId,
+            model: extractorModelId,
             pages_scanned: 0,
             cache_hits: 0,
             cache_misses: 0,
@@ -479,7 +489,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
 
       // Budget pre-check before the LLM call. Estimate: ~1500 input tokens + 500 output.
       const budget = this.checkBudget({
-        modelId,
+        modelId: extractorModelId,
         estimatedInputTokens: 1500,
         maxOutputTokens: 500,
       });
@@ -498,7 +508,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
           pagePath: page.slug,
           pageBody: body,
           existingTakes,
-          modelHint: opts.model,
+          modelHint: extractorModelId,
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -521,7 +531,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
               status, claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id)
            VALUES ($1, $2, $3, $4, $5, 'empty', '', 'none', 'brain', 0, NULL, NULL, $6)
            ON CONFLICT (source_id, page_slug, content_hash, prompt_version, md5(claim_text)) DO NOTHING`,
-          [sourceId, page.slug, ch, promptVersion, proposalRunId, modelId],
+          [sourceId, page.slug, ch, promptVersion, proposalRunId, extractorModelId],
         );
         continue;
       }
@@ -554,7 +564,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
             p.weight,
             p.domain ?? null,
             JSON.stringify(existingTakes),
-            modelId,
+            extractorModelId,
           ],
         );
         if (landed.length > 0) result.proposals_inserted += 1;
